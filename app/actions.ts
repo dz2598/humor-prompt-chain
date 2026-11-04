@@ -73,7 +73,7 @@ function fill(template: string, input: string, outputs: string[], hasImage: bool
   return template.replaceAll("{{prompt}}", input).replaceAll("{{previous_output}}", previous).replaceAll("{{image_analysis}}", outputs[0] || "").replaceAll("{{scenario_analysis}}", outputs[1] || "").replaceAll("{{image}}", hasImage ? "[attached image]" : "[No image provided]");
 }
 
-export async function generateWithChain(chainId: number, data: FormData) {
+async function generateWithChain(chainId: number, data: FormData) {
   const { supabase, user } = await requireAdmin();
   const input = text(data, "prompt");
   const image = data.get("image");
@@ -109,5 +109,16 @@ export async function generateWithChain(chainId: number, data: FormData) {
     throw error;
   }
   revalidatePath(`/chains/${chainId}`);
-  redirect(`/chains/${chainId}#generated`);
+}
+
+export async function runChainTest(chainId: number, _state: { error: string; success: boolean }, data: FormData) {
+  try {
+    await generateWithChain(chainId, data);
+    return { error: "", success: true };
+  } catch (error) {
+    console.error("Chain test failed:", error);
+    const message = error instanceof Error ? error.message : "";
+    const isBusy = /503|high demand|overloaded|unavailable/i.test(message);
+    return { error: isBusy ? "The AI service is busy. Please try again in a minute." : "Generation failed. Please check the image and try again.", success: false };
+  }
 }
