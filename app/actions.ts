@@ -68,30 +68,42 @@ export async function reorderSteps(chainId: number, orderedIds: number[]) {
   revalidatePath(`/chains/${chainId}`);
 }
 
-function fill(template: string, input: string, previous: string) {
-  return template.replaceAll("{{prompt}}", input).replaceAll("{{previous_output}}", previous).replaceAll("{{image_analysis}}", previous).replaceAll("{{scenario_analysis}}", previous);
+function fill(template: string, input: string, outputs: string[], hasImage: boolean) {
+  const previous = outputs.at(-1) || "";
+  return template.replaceAll("{{prompt}}", input).replaceAll("{{previous_output}}", previous).replaceAll("{{image_analysis}}", outputs[0] || "").replaceAll("{{scenario_analysis}}", outputs[1] || "").replaceAll("{{image}}", hasImage ? "[attached image]" : "[No image provided]");
 }
 
 export async function generateWithChain(chainId: number, data: FormData) {
   const { supabase, user } = await requireAdmin();
   const input = text(data, "prompt");
-  if (!input) throw new Error("Enter a test prompt.");
+  const image = data.get("image");
+  const hasImage = image instanceof File && image.size > 0;
+  if (!input && !hasImage) throw new Error("Enter a test prompt or select an image.");
+  if (hasImage && (!image.type.startsWith("image/") || image.size > 3 * 1024 * 1024)) throw new Error("Select an image smaller than 3 MB.");
+  const imageData = hasImage ? Buffer.from(await image.arrayBuffer()).toString("base64") : null;
   const { data: steps, error: stepsError } = await supabase.from("prompt_chain_steps").select("*").eq("prompt_chain_id", chainId).order("step_order");
   if (stepsError || !steps?.length) throw new Error(stepsError?.message || "Create at least one step first.");
   const { data: request, error: requestError } = await supabase.from("generation_requests").insert({ user_id: user.id, prompt_chain_id: chainId, input_prompt: input, status: "processing" }).select("id").single();
   if (requestError) throw new Error(requestError.message);
   const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
-  let previous = "";
+  const outputs: string[] = [];
   try {
-    for (const step of steps) {
+    for (const [index, step] of steps.entries()) {
       const started = performance.now();
       const template = String(step.user_prompt_template || "Input: {{prompt}}\nPrevious output: {{previous_output}}");
-      const interaction = await ai.interactions.create({ model: modelName, input: [{ type: "text", text: `${step.system_prompt || ""}\n\n${fill(template, input, previous)}` }] });
-      previous = interaction.output_text?.trim() || "";
+      const instruction = `${step.system_prompt || ""}\n\n${fill(template, input, outputs, hasImage)}`;
+      const stepInput: Parameters<typeof ai.interactions.create>[0]["input"] = index === 0 && imageData && image instanceof File
+        ? [{ type: "text", text: instruction }, { type: "image", data: imageData, mime_type: image.type }]
+        : [{ type: "text", text: instruction }];
+      const interaction = await ai.interactions.create({ model: modelName, input: stepInput });
+      const previous = interaction.output_text?.trim() || "";
       if (!previous) throw new Error(`Step ${step.step_order} returned no output.`);
-      await supabase.from("llm_responses").insert({ generation_request_id: request.id, step_order: step.step_order, step_name: step.name, response_text: previous, latency_ms: Math.round(performance.now() - started) });
+      const { error: responseError } = await supabase.from("llm_responses").insert({ generation_request_id: request.id, step_order: step.step_order, step_name: step.name, response_text: previous, latency_ms: Math.round(performance.now() - started) });
+      if (responseError) throw new Error(`Could not record step ${step.step_order}: ${responseError.message}`);
+      outputs.push(previous);
     }
-    await supabase.from("generation_requests").update({ status: "completed", completed_at: new Date().toISOString() }).eq("id", request.id);
+    const { error: completionError } = await supabase.from("generation_requests").update({ status: "completed", completed_at: new Date().toISOString() }).eq("id", request.id);
+    if (completionError) throw new Error(`Could not complete the request: ${completionError.message}`);
   } catch (error) {
     await supabase.from("generation_requests").update({ status: "failed", completed_at: new Date().toISOString() }).eq("id", request.id);
     throw error;
